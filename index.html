@@ -1,0 +1,271 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Polygon Arbitrage Auto-Trader</title>
+  <script src="https://cdn.jsdelivr.net/npm/ethers@5.7.2/dist/ethers.umd.min.js"></script>
+  <style>
+    body {
+      background-color: #0b0c2a;
+      color: #e0e0e0;
+      font-family: Arial, sans-serif;
+      padding: 20px;
+    }
+    h1 {
+      text-align: center;
+    }
+    button, input {
+      background-color: #00ff91;
+      color: #0b0c2a;
+      border: none;
+      padding: 10px;
+      margin: 5px;
+      border-radius: 8px;
+      font-weight: bold;
+      cursor: pointer;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 20px;
+      background-color: #1e1f3a;
+    }
+    th, td {
+      border: 1px solid #333;
+      padding: 8px;
+      text-align: center;
+    }
+    th {
+      background-color: #2b2d5a;
+    }
+    #profit {
+      margin-top: 20px;
+      font-size: 24px;
+      text-align: center;
+      color: #00ff91;
+    }
+    .green { color: #00ff91; }
+    .red { color: #ff4c4c; }
+  </style>
+</head>
+
+<body>
+
+<h1>Polygon Arbitrage Auto-Trader</h1>
+
+<div style="text-align:center;">
+  <button onclick="connectWallet()">Connect Wallet</button><br>
+  Trade Size (USDC): <input id="tradeAmountInput" type="number" value="0.1" min="0.0001" step="0.0001" onchange="updateTradeAmount()"><br>
+  <button onclick="toggleMode()">Mode: Profit Only ✅</button>
+</div>
+
+<div id="walletInfo" style="text-align:center; margin-top:10px;">
+  Wallet: <span id="walletAddress">Not Connected</span><br>
+  USDC Balance: <span id="usdcBalance">-</span><br>
+  WBTC Balance: <span id="tokenBalance">-</span>
+</div>
+
+<div id="profit">Accumulated P/L: $0.0000</div>
+
+<table id="logTable">
+  <thead>
+    <tr>
+      <th>Time</th>
+      <th>DEX Route</th>
+      <th>USDC In</th>
+      <th>WBTC Out</th>
+      <th>USDC Returned</th>
+      <th>Gross Profit</th>
+      <th>Net Profit</th>
+      <th>Mode</th>
+      <th>Status</th>
+    </tr>
+  </thead>
+  <tbody></tbody>
+</table>
+
+<script>
+let provider, signer, walletAddress;
+let accumulatedProfit = 0;
+let tradingInterval = null;
+let currentTradeAmount = ethers.utils.parseUnits('0.1', 6);
+let profitOnly = true; // Toggle variable
+
+const usdcAddress = '0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174';
+const wbtcAddress = '0x1bfd67037b42cf73acf2047067bd4f2c47d9bfd6';
+
+const routers = {
+  QuickSwap: '0xa5E0829CaCEd8fFDD4De3c43696c57F7D7A678ff',
+  SushiSwap: '0x1b02da8cb0d097eb8d57a175b88c7d8b47997506',
+  Uniswap:  '0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45'
+};
+
+const routerAbi = [
+  "function getAmountsOut(uint amountIn, address[] calldata path) external view returns (uint[] memory amounts)",
+  "function swapExactTokensForTokens(uint amountIn, uint amountOutMin, address[] calldata path, address to, uint deadline) external returns (uint[] memory amounts)"
+];
+
+const erc20Abi = [
+  "function balanceOf(address owner) view returns (uint256)",
+  "function approve(address spender, uint256 amount) external returns (bool)",
+  "function decimals() view returns (uint8)"
+];
+
+async function connectWallet() {
+  if (window.ethereum) {
+    provider = new ethers.providers.Web3Provider(window.ethereum);
+    await provider.send("eth_requestAccounts", []);
+    signer = provider.getSigner();
+    walletAddress = await signer.getAddress();
+    document.getElementById('walletAddress').innerText = walletAddress;
+    await approveTokens();
+    await getBalances();
+    startTrading();
+  } else {
+    alert("Please install MetaMask!");
+  }
+}
+
+async function approveTokens() {
+  const usdc = new ethers.Contract(usdcAddress, erc20Abi, signer);
+  const wbtc = new ethers.Contract(wbtcAddress, erc20Abi, signer);
+
+  for (let router of Object.values(routers)) {
+    await usdc.approve(router, ethers.constants.MaxUint256);
+    await wbtc.approve(router, ethers.constants.MaxUint256);
+  }
+}
+
+async function getBalances() {
+  const usdc = new ethers.Contract(usdcAddress, erc20Abi, provider);
+  const wbtc = new ethers.Contract(wbtcAddress, erc20Abi, provider);
+
+  const usdcBalance = await usdc.balanceOf(walletAddress);
+  const wbtcBalance = await wbtc.balanceOf(walletAddress);
+
+  document.getElementById('usdcBalance').innerText = (usdcBalance / 1e6).toFixed(4) + " USDC";
+  document.getElementById('tokenBalance').innerText = (wbtcBalance / 1e8).toFixed(6) + " WBTC";
+}
+
+async function simulateAndTrade() {
+  if (!walletAddress) return;
+
+  const dexNames = Object.keys(routers);
+  const routerInstances = dexNames.map(name => new ethers.Contract(routers[name], routerAbi, signer));
+  
+  try {
+    for (let i = 0; i < routerInstances.length; i++) {
+      for (let j = 0; j < routerInstances.length; j++) {
+        if (i === j) continue;
+
+        const routerIn = routerInstances[i];
+        const routerOut = routerInstances[j];
+
+        const outWBTC = await routerIn.getAmountsOut(currentTradeAmount, [usdcAddress, wbtcAddress]);
+        const outUSDC = await routerOut.getAmountsOut(outWBTC[1], [wbtcAddress, usdcAddress]);
+
+        const grossProfit = (outUSDC[1].sub(currentTradeAmount)).toString() / 1e6;
+        const netProfit = grossProfit - 0.00002;
+
+        const shouldTrade = profitOnly ? netProfit > 0 : true;
+
+        if (shouldTrade) {
+          await executeTrade(routerIn, routerOut, currentTradeAmount);
+          accumulatedProfit += Number(netProfit);
+          updateProfit();
+          logTrade(dexNames[i], dexNames[j], 
+            (currentTradeAmount.toString() / 1e6).toFixed(6),
+            (outWBTC[1].toString() / 1e8).toFixed(8),
+            (outUSDC[1].toString() / 1e6).toFixed(6),
+            grossProfit.toFixed(6),
+            netProfit.toFixed(6),
+            profitOnly ? "Profit Only" : "Always Trade",
+            "Executed ✅");
+          await getBalances();
+          return;
+        } else {
+          logTrade(dexNames[i], dexNames[j], 
+            (currentTradeAmount.toString() / 1e6).toFixed(6),
+            (outWBTC[1].toString() / 1e8).toFixed(8),
+            (outUSDC[1].toString() / 1e6).toFixed(6),
+            grossProfit.toFixed(6),
+            netProfit.toFixed(6),
+            profitOnly ? "Profit Only" : "Always Trade",
+            "Skipped ❌");
+        }
+      }
+    }
+  } catch (e) {
+    console.error("Trade error:", e);
+  }
+}
+
+async function executeTrade(routerIn, routerOut, amountIn) {
+  const deadline = Math.floor(Date.now() / 1000) + 60;
+
+  await routerIn.swapExactTokensForTokens(
+    amountIn,
+    0,
+    [usdcAddress, wbtcAddress],
+    walletAddress,
+    deadline
+  );
+
+  const wbtc = new ethers.Contract(wbtcAddress, erc20Abi, signer);
+  const wbtcBalance = await wbtc.balanceOf(walletAddress);
+
+  await routerOut.swapExactTokensForTokens(
+    wbtcBalance,
+    0,
+    [wbtcAddress, usdcAddress],
+    walletAddress,
+    deadline
+  );
+}
+
+function startTrading() {
+  if (tradingInterval) clearInterval(tradingInterval);
+  tradingInterval = setInterval(simulateAndTrade, 10000); // every 10 seconds
+}
+
+function updateTradeAmount() {
+  const val = parseFloat(document.getElementById('tradeAmountInput').value);
+  if (val < 0.0001) {
+    alert("Minimum trade size is $0.0001 USDC!");
+    document.getElementById('tradeAmountInput').value = 0.0001;
+    currentTradeAmount = ethers.utils.parseUnits('0.0001', 6);
+  } else {
+    currentTradeAmount = ethers.utils.parseUnits(val.toString(), 6);
+  }
+}
+
+function updateProfit() {
+  document.getElementById('profit').innerText = `Accumulated P/L: $${accumulatedProfit.toFixed(6)}`;
+}
+
+function logTrade(dexIn, dexOut, usdcIn, wbtcOut, usdcBack, gross, net, mode, status) {
+  const table = document.getElementById('logTable').getElementsByTagName('tbody')[0];
+  const newRow = table.insertRow();
+  const currentTime = new Date().toLocaleTimeString();
+  newRow.innerHTML = `
+    <td>${currentTime}</td>
+    <td>${dexIn} ➔ ${dexOut}</td>
+    <td>$${usdcIn}</td>
+    <td>${wbtcOut}</td>
+    <td>$${usdcBack}</td>
+    <td>$${gross}</td>
+    <td class="${net >= 0 ? 'green' : 'red'}">$${net}</td>
+    <td>${mode}</td>
+    <td>${status}</td>
+  `;
+}
+
+function toggleMode() {
+  profitOnly = !profitOnly;
+  const button = document.querySelector('button[onclick="toggleMode()"]');
+  button.innerText = profitOnly ? "Mode: Profit Only ✅" : "Mode: Always Trade ⚡";
+}
+</script>
+
+</body>
+</html>
